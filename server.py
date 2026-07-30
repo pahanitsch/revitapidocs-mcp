@@ -5,13 +5,14 @@
 """MCP server for Revit API docs and The Building Coder blog.
 
 No API keys and no embeddings. API search goes through the public autocomplete
-backend that powers revitapidocs.com; blog search greps a local sparse clone of
-github.com/jeremytammik/tbc.
+backend that powers revitapidocs.com; blog search greps a sparse clone of
+github.com/jeremytammik/tbc that this server clones and pulls on its own.
 """
 
 import os
 import re
 import ssl
+import subprocess
 import sys
 import time
 from html import unescape
@@ -32,9 +33,35 @@ _HTTP = httpx.Client(
 # Public key, lifted from the revitapidocs.com frontend.
 _AC_KEY = "key_yyAC1mb0cTgZTwSo"
 
-_TBC = Path(os.environ.get("TBC_PATH") or Path(__file__).parent / "tbc" / "a")
+_REPO = Path(__file__).parent / "tbc"
+_TBC = Path(os.environ["TBC_PATH"]) if os.environ.get("TBC_PATH") else _REPO / "a"
 
 mcp = MCPServer("revit-docs")
+
+
+def _git(*args: str) -> None:
+    subprocess.run(["git", *args], check=True, capture_output=True, timeout=600)
+
+
+def _sync_blog() -> None:
+    """Clone the blog on first start, pull updates on every start after.
+
+    Only the post text is checked out: 45 MB instead of 1.6 GB of images and zips.
+    A failure here is not fatal, an existing clone still answers searches.
+    """
+    if os.environ.get("TBC_PATH"):
+        return  # someone else's checkout, not ours to manage
+    try:
+        # ponytail: pulls on every spawn, cheap enough; gate on FETCH_HEAD mtime if it annoys.
+        if _REPO.is_dir():
+            _git("-C", str(_REPO), "pull", "--quiet")
+        else:
+            url = "https://github.com/jeremytammik/tbc.git"
+            _git("clone", "--depth", "1", "--filter=blob:none", "--sparse", "--quiet", url, str(_REPO))
+            _git("-C", str(_REPO), "sparse-checkout", "set", "--no-cone", "/a/*.md", "/a/*.htm", "/a/*.html")
+    except (OSError, subprocess.SubprocessError) as exc:
+        # stdout is the JSON-RPC channel, so complain on stderr.
+        print(f"blog sync skipped: {exc}", file=sys.stderr)
 
 
 def _text(html: str) -> str:
@@ -114,7 +141,7 @@ def search_blog(pattern: str, limit: int = 10, context: int = 2) -> list[dict]:
         context: lines of context to include around each match.
     """
     if not _TBC.is_dir():
-        return [{"error": f"blog clone missing at {_TBC}; see the setup notes"}]
+        return [{"error": f"no blog clone at {_TBC}; startup sync failed, see the server log"}]
 
     needle = re.compile(pattern, re.IGNORECASE)
     posts = []
@@ -157,6 +184,7 @@ def _self_check() -> None:
 
 
 if __name__ == "__main__":
+    _sync_blog()
     if "--check" in sys.argv:
         _self_check()
     else:
