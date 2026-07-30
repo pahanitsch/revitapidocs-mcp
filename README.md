@@ -15,7 +15,7 @@
 Нужны [uv](https://docs.astral.sh/uv/) (запускает `server.py` как self-contained скрипт, зависимости в шапке файла) и `git`.
 
 ```bash
-git clone <URL> revitapidocs-mcp
+git clone https://github.com/fenyag7/revitapidocs-mcp.git
 cd revitapidocs-mcp
 
 # sparse-клон блога — только текст (~45 МБ), без картинок/PDF/zip (~1.6 ГБ)
