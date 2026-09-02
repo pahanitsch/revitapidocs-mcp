@@ -33,6 +33,19 @@ _HTTP = httpx.Client(
 # Public key, lifted from the revitapidocs.com frontend.
 _AC_KEY = "key_yyAC1mb0cTgZTwSo"
 
+# Every revitapidocs page id is a SandCastle GUID; anything else is a name.
+_GUID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+# Words that name an entity's kind rather than the entity itself; dropped
+# before falling back to a single-token query.
+_NOISE = {
+    "class", "method", "property", "properties", "enumeration", "member",
+    "constructor", "interface", "structure", "namespace", "fields", "methods",
+    "delegate", "event", "operator",
+}
+
 _REPO = Path(__file__).parent / "tbc"
 _TBC = Path(os.environ["TBC_PATH"]) if os.environ.get("TBC_PATH") else _REPO / "a"
 
@@ -76,18 +89,20 @@ def _text(html: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-@mcp.tool()
-def search_api(query: str, year: str = "2026", limit: int = 10) -> list[dict]:
-    """Search the Revit API for classes, methods, properties and enums.
+def _tokens(query: str) -> list[str]:
+    """Single-identifier fallbacks for a phrase, most specific first.
 
-    Returns entries whose `guid` feeds straight into get_doc. The type is part of
-    the title, e.g. "FilteredElementCollector Class".
-
-    Args:
-        query: entity name or fragment, e.g. "FilteredElementCollector" or "OfCategory".
-        year: Revit version, one of 2022-2027 (also "2025.3").
-        limit: maximum number of results.
+    The backend is a prefix matcher over entity names, so "Document.Save" or
+    "Document Save Method" match nothing. Retry with the last bare identifier,
+    then the first: "Document Save Method" -> "Save" then "Document".
     """
+    words = [w for w in re.split(r"[^0-9A-Za-z]+", query) if w]
+    core = [w for w in words if w.lower() not in _NOISE] or words
+    return list(dict.fromkeys([core[-1], core[0]])) if core else []
+
+
+def _autocomplete(query: str, limit: int, year: str) -> list[dict]:
+    """One raw call to the autocomplete backend, normalized to result dicts."""
     response = _HTTP.get(
         f"https://ac.cnstrc.com/autocomplete/{query}",
         params={
@@ -116,24 +131,90 @@ def search_api(query: str, year: str = "2026", limit: int = 10) -> list[dict]:
 
 
 @mcp.tool()
+def search_api(query: str, year: str = "2026", limit: int = 10) -> dict:
+    """Search the Revit API for a class, method, property or enum by name.
+
+    Pass a SINGLE identifier, no spaces and no dots: "SaveAsOptions", not
+    "Document Save Method" and not "Document.Save". The backend is a prefix
+    matcher over entity names, so a phrase or a dotted path matches nothing. To
+    reach a member, search its declaring type ("Dimension") and read the member
+    list, or search the bare member name ("Save").
+
+    For "how do I ..." questions try search_blog first; use search_api when you
+    need the exact class, signature or enum member.
+
+    Returns {"results": [...], "note": <optional>}. Each result's `guid` feeds
+    straight into get_doc, and the type is part of the title ("Dimension Class").
+    A `note` appears when nothing matched the query verbatim: either the results
+    are for a fallback identifier, or there are none and it suggests a rephrase.
+
+    The search index is version-agnostic: `year` only shapes the returned `url`
+    and is what get_doc will use. A guid for a member added after `year` can 404
+    in get_doc even though it shows up here.
+
+    Args:
+        query: one identifier, e.g. "FilteredElementCollector" or "OfCategory".
+        year: Revit version, one of 2022-2027 (also "2025.3").
+        limit: maximum number of results.
+    """
+    results = _autocomplete(query, limit, year)
+    if results:
+        return {"results": results}
+
+    for token in _tokens(query):
+        if token == query:
+            continue
+        results = _autocomplete(token, limit, year)
+        if results:
+            return {
+                "results": results,
+                "note": f"no match for {query!r}; showing results for {token!r}",
+            }
+
+    return {
+        "results": [],
+        "note": (
+            f"no match for {query!r}; retry with a single identifier such as a "
+            f"class name ('Dimension') or a bare method name ('Save')"
+        ),
+    }
+
+
+@mcp.tool()
 def get_doc(guid: str, year: str = "2026") -> str:
     """Fetch a Revit API documentation page as plain text.
 
     Args:
-        guid: page id from search_api, with or without the ".htm" suffix.
+        guid: page id from search_api (a GUID), with or without the ".htm"
+            suffix. A human-readable name like "Dimension Class" is resolved
+            through search_api first; pass a real guid to skip that lookup.
         year: Revit version, one of 2022-2027 (also "2025.3").
     """
     page = guid.removesuffix(".htm")
+    note = ""
+    if not _GUID.match(page):
+        hits = _autocomplete(page, 5, year)
+        if not hits:
+            raise ValueError(
+                f"{guid!r} is not a page id and search found nothing for it; "
+                f"call search_api first and pass a guid from its results"
+            )
+        note = f"(resolved {guid!r} via search to {hits[0]['title']!r})\n\n"
+        page = hits[0]["guid"]
+
     response = _HTTP.get(f"https://www.revitapidocs.com/{year}/{page}.htm")
     response.raise_for_status()
-    return _text(response.text)
+    return note + _text(response.text)
 
 
 @mcp.tool()
 def search_blog(pattern: str, limit: int = 10, context: int = 2) -> list[dict]:
     """Search The Building Coder blog for Revit API techniques and sample code.
 
-    Covers 15 years of posts that rarely surface anywhere else. Newest posts first.
+    Covers 15 years of posts that rarely surface anywhere else. Reach for this
+    first on "how do I ..." questions and for constraints the reference omits
+    (e.g. which calls throw when); use search_api for an exact class, signature
+    or enum member. Newest posts first.
 
     Args:
         pattern: regular expression, case-insensitive.
@@ -171,16 +252,27 @@ def search_blog(pattern: str, limit: int = 10, context: int = 2) -> list[dict]:
 
 
 def _self_check() -> None:
-    hits = search_api("FilteredElementCollector")
+    hits = search_api("FilteredElementCollector")["results"]
     guid = next(h["guid"] for h in hits if h["title"] == "FilteredElementCollector Class")
 
     doc = get_doc(guid)
     assert "Autodesk.Revit.DB" in doc, doc[:400]
 
+    # A phrase query must recover through the fallback, not read as empty.
+    phrase = search_api("Document Save Method")
+    assert phrase["results"] and "note" in phrase, phrase
+
+    # A human-readable name must resolve instead of 404ing upstream.
+    named = get_doc("Dimension Class")
+    assert "Autodesk.Revit.DB" in named, named[:400]
+
     posts = search_blog("FilteredElementCollector")
     assert posts and "error" not in posts[0], posts
 
-    print(f"ok: {len(hits)} api hits, {len(doc)} chars of doc, {len(posts)} blog posts")
+    print(
+        f"ok: {len(hits)} api hits, {len(doc)} chars of doc, "
+        f"{len(posts)} blog posts, fallback + name-resolve pass"
+    )
 
 
 if __name__ == "__main__":
