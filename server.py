@@ -46,6 +46,10 @@ _NOISE = {
     "delegate", "event", "operator",
 }
 
+# A blog post file. The two index pages list every post, so they match almost
+# any pattern; excluding them here keeps them out of search results.
+_POST = re.compile(r"\d{4}_.*\.(md|html?)$", re.IGNORECASE)
+
 _REPO = Path(__file__).parent / "tbc"
 _TBC = Path(os.environ["TBC_PATH"]) if os.environ.get("TBC_PATH") else _REPO / "a"
 
@@ -228,7 +232,7 @@ def search_blog(pattern: str, limit: int = 10, context: int = 2) -> list[dict]:
     posts = []
     # Filenames are zero-padded and chronological, so reverse order is newest first.
     for path in sorted(_TBC.iterdir(), reverse=True):
-        if path.suffix not in (".md", ".htm", ".html"):
+        if not _POST.match(path.name):
             continue
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         hits = [i for i, line in enumerate(lines) if needle.search(line)]
@@ -268,6 +272,7 @@ def _self_check() -> None:
 
     posts = search_blog("FilteredElementCollector")
     assert posts and "error" not in posts[0], posts
+    assert not any(p["post"].startswith("index") for p in posts), posts
 
     print(
         f"ok: {len(hits)} api hits, {len(doc)} chars of doc, "
