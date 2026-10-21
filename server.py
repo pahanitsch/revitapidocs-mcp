@@ -27,8 +27,8 @@ import httpx
 import truststore
 from mcp.server.mcpserver import Context, MCPServer
 
-# The corporate proxy re-signs TLS, so certifi rejects every connection.
-# Trust the Windows certificate store instead.
+# Trust the operating system's certificate store rather than certifi's bundle,
+# so the server keeps working where TLS is re-signed in transit.
 _HTTP = httpx.Client(
     verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
     timeout=30,
