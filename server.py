@@ -55,6 +55,11 @@ _NOISE = {
 # any pattern; excluding them here keeps them out of search results.
 _POST = re.compile(r"\d{4}_.*\.(md|html?)$", re.IGNORECASE)
 
+# Posts link their pictures relatively, as src="img/..." or ](img/...). The
+# clone holds text only, so these resolve against the blog's own mirror.
+_IMG = re.compile(r"""(?:src=["']|\]\()(img/[^"')\s]+\.(?:png|jpe?g|gif))""", re.IGNORECASE)
+_IMG_BASE = "https://jeremytammik.github.io/tbc/a/"
+
 _REPO = Path(__file__).parent / "tbc"
 _TBC = Path(os.environ["TBC_PATH"]) if os.environ.get("TBC_PATH") else _REPO / "a"
 
@@ -165,6 +170,17 @@ def _sync_blog() -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         # stdout is the JSON-RPC channel, so complain on stderr.
         print(f"blog sync skipped: {exc}", file=sys.stderr)
+
+
+def _images(body: str, limit: int = 5) -> list[str]:
+    """Absolute URLs for the pictures a post links relatively.
+
+    Half the posts carry a screenshot or a diagram the prose does not describe.
+    Cloning them all would cost 946 MB against 76 MB of text and would not make a
+    single search faster, so name them and let the caller fetch the one it wants.
+    """
+    found = dict.fromkeys(match.group(1) for match in _IMG.finditer(body))
+    return [_IMG_BASE + rel for rel in list(found)[:limit]]
 
 
 def _text(html: str) -> str:
@@ -283,7 +299,9 @@ def get_doc(guid: str, year: str = "2026", ctx: Context | None = None) -> str:
         guid: page id from search_api (a GUID), with or without the ".htm"
             suffix. A human-readable name like "Dimension Class" is resolved
             through search_api first; pass a real guid to skip that lookup.
-        year: Revit version, one of 2022-2027 (also "2025.3").
+        year: Revit version. revitapidocs.com covers 2022-2027 (also "2025.3");
+            2020 and 2021 come from rvtdocs.com, which also stands in whenever
+            revitapidocs.com is unreachable.
     """
     with _logged("get_doc", ctx, query=guid, year=year) as record:
         page = guid.removesuffix(".htm")
@@ -299,8 +317,20 @@ def get_doc(guid: str, year: str = "2026", ctx: Context | None = None) -> str:
             page = hits[0]["guid"]
             record["resolved"] = page
 
-        response = _HTTP.get(f"https://www.revitapidocs.com/{year}/{page}.htm")
-        response.raise_for_status()
+        try:
+            response = _HTTP.get(f"https://www.revitapidocs.com/{year}/{page}.htm")
+            response.raise_for_status()
+            record["source"] = "revitapidocs"
+        except httpx.HTTPError as exc:
+            # One undocumented backend is how every earlier Revit docs server died.
+            # rvtdocs.com resolves the same page ids, covers 2020-2027, and its
+            # llms.txt invites MCP tools to quote it with a citation.
+            response = _HTTP.get(f"https://rvtdocs.com/{year}/{page}")
+            response.raise_for_status()
+            record["source"] = "rvtdocs"
+            reason = getattr(getattr(exc, "response", None), "status_code", None) or type(exc).__name__
+            note += f"(revitapidocs.com: {reason}; served from rvtdocs.com instead)\n\n"
+
         text = note + _text(response.text)
         record["chars"] = len(text)
         return text
@@ -334,7 +364,8 @@ def search_blog(
         for path in sorted(_TBC.iterdir(), reverse=True):
             if not _POST.match(path.name):
                 continue
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            body = path.read_text(encoding="utf-8", errors="replace")
+            lines = body.splitlines()
             hits = [i for i, line in enumerate(lines) if needle.search(line)]
             if not hits:
                 continue
@@ -342,14 +373,15 @@ def search_blog(
             for i in hits[:5]:
                 window = lines[max(0, i - context) : i + context + 1]
                 snippets.append(_text("\n".join(window)))
-            posts.append(
-                {
-                    "post": path.name,
-                    "url": f"https://thebuildingcoder.typepad.com/blog/{path.stem}",
-                    "matches": len(hits),
-                    "snippets": snippets,
-                }
-            )
+            post = {
+                "post": path.name,
+                "url": f"https://thebuildingcoder.typepad.com/blog/{path.stem}",
+                "matches": len(hits),
+                "snippets": snippets,
+            }
+            if images := _images(body):
+                post["images"] = images
+            posts.append(post)
             if len(posts) >= limit:
                 break
         record["results"] = len(posts)
@@ -409,6 +441,15 @@ def _self_check() -> None:
     posts = search_blog("FilteredElementCollector")
     assert posts and "error" not in posts[0], posts
     assert not any(p["post"].startswith("index") for p in posts), posts
+
+    # Pictures are named, not cloned, so the URLs have to be real.
+    illustrated = next(p for p in search_blog("img src", limit=3) if "images" in p)
+    assert illustrated["images"][0].startswith(_IMG_BASE), illustrated
+    assert _HTTP.head(illustrated["images"][0]).status_code == 200, illustrated["images"][0]
+
+    # The fallback itself, not just the second source: 2021 predates revitapidocs.
+    spare = get_doc(guid, year="2021")
+    assert "rvtdocs.com instead" in spare and "FilteredElementCollector" in spare, spare[:400]
 
     _check_logging()
 
