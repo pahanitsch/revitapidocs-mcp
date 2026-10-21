@@ -25,3 +25,14 @@ uv run --system-certs --script server.py --check
 ```
 
 `--system-certs` lets `uv` reach PyPI through a TLS-inspecting corporate proxy; the server itself already trusts the system certificate store. Set `TBC_PATH` to use a blog checkout elsewhere — the server then leaves it alone instead of syncing it.
+
+## Logging
+
+Off until `REVIT_DOCS_LOG` names a directory to write into. A tool that records what was asked of it should say so before it starts recording, so there is no default-on path.
+
+Two JSON Lines files, appended and never rotated. A call costs a few hundred bytes, so expect kilobytes a month rather than megabytes.
+
+- `calls.jsonl` — one line per call: timestamp, pid, a run id grouping one session's calls, the client's name when it identified itself, tool, the query, result count, which fallback fired, duration, and whether it succeeded.
+- `errors.jsonl` — failures only, with exception type, message and traceback. A one-line summary also goes to stderr so the client surfaces it immediately.
+
+Queries are recorded, results are not: a query and a timestamp are enough to replay the call.
